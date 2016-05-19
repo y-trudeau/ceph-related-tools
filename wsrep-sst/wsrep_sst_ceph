@@ -50,6 +50,7 @@ sockopt=""
 ttime=0
 totime=0
 tcmd=""
+tfmt="nc"
 lsn=""
 ecmd=""
 rlimit=""
