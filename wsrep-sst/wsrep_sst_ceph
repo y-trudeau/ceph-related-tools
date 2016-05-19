@@ -56,7 +56,6 @@ rlimit=""
 # Initially
 stagemsg="${WSREP_SST_OPT_ROLE}"
 speciald=1
-cephimage=""
 cephmountpoint=""
 cephmountoption=""
 cephkeyring=""
@@ -168,7 +167,6 @@ parse_cnf()
 
 read_cnf()
 {
-    cephimage=$(parse_cnf sst cephimage "") # main cluster image
     cephlocalpool=$(parse_cnf sst cephlocalpool "") 
     cephmountoption=$(parse_cnf sst cephmountoption "rw,noatime")
     cephmountpoint=$(parse_cnf sst cephmountpoint "${DATA}")
@@ -268,18 +266,8 @@ if [[ ! -x `which $RBD_BIN` ]];then
     exit 2
 fi
 
-if [[ ! -x `which $SUDO_BIN` ]];then 
+if [[ ! -x `which sudo` ]];then 
     wsrep_log_error "sudo not in path: $PATH"
-    exit 2
-fi
-
-if [[ ! -x `which $MOUNT_BIN` ]];then 
-    wsrep_log_error "mount not in path: $PATH"
-    exit 2
-fi
-
-if [[ ! -x `which $UMOUNT_BIN` ]];then 
-    wsrep_log_error "umount not in path: $PATH"
     exit 2
 fi
 
@@ -353,7 +341,7 @@ case "$WSREP_SST_OPT_ROLE" in
 
         sync
 
-        wsrep_log_info "Taking a Ceph snapshot of $cephimage"
+        wsrep_log_info "Taking a Ceph snapshot of $currentimage"
 
         set +e
         timeit "Ceph-Snap-SST" "$RBDSNAP; RC=( "\${PIPESTATUS[@]}" )"
@@ -368,7 +356,7 @@ case "$WSREP_SST_OPT_ROLE" in
             exit 22
         fi
 
-        wsrep_log_info "Protecing the Ceph snapshot of ${cephimage}@${start_ts}"
+        wsrep_log_info "Protecing the Ceph snapshot of ${currentimage}@${start_ts}"
 
         set +e
         timeit "Ceph-Snap-SST" "$RBDSNAPPROTECT; RC=( "\${PIPESTATUS[@]}" )"
@@ -535,6 +523,7 @@ case "$WSREP_SST_OPT_ROLE" in
         
         # Chown (Is binlog dir needed too?)
         chown -R $mysqluser ${DATA} 
+        
         ;;
 
         
