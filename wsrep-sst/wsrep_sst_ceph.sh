@@ -1,0 +1,545 @@
+#!/bin/bash -ue
+# Copyright (C) 2016 Percona Inc
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not, write to the
+# Free Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston
+# MA  02110-1301  USA.
+
+
+##########################################################################
+# If DEBUG_LOG is set, make this script to debug: set up the
+# debug log and direct all output to it.  Otherwise, redirect to /dev/null.
+# The log directory must be a directory, the log file must be writable and 
+# not a symlink.
+##########################################################################
+DEBUG_LOG="/tmp/ceph-sst/log"
+if [ "${DEBUG_LOG}" -a -w "${DEBUG_LOG}" -a ! -L "${DEBUG_LOG}" ]; then
+   DEBUG_LOG_DIR="${DEBUG_LOG%/*}"
+   if [ -d "${DEBUG_LOG_DIR}" ]; then
+      exec 9>>"$DEBUG_LOG"
+      exec 2>&9
+      echo '=====================================================' >&9
+      date >&9
+      echo "$*" >&9
+      set -x
+   else
+      exec 9>/dev/null
+   fi
+fi
+
+. $(dirname $0)/wsrep_sst_common
+
+nproc=1
+ecode=0
+encrypt=0  # not used with ceph, no real data over the network
+ssyslog=""
+ssystag="SST-"
+SST_PORT=""
+REMOTEIP=""
+sockopt=""
+ttime=0
+totime=0
+tcmd=""
+lsn=""
+ecmd=""
+rlimit=""
+# Initially
+stagemsg="${WSREP_SST_OPT_ROLE}"
+speciald=1
+cephimage=""
+cephmountpoint=""
+cephmountoption=""
+cephkeyring=""
+mysqluser=""
+
+current_ts=0
+
+STATDIR=""
+uextra=0
+disver=""
+
+tmpopts=""
+tempdir=""
+
+
+# Required for backup locks
+# For backup locks it is 1 sent by joiner
+# 5.6.21 PXC and later can't donate to an older joiner
+sst_ver=1
+
+declare -a RC
+
+RBD_BIN=$(which rbd)
+
+DATA="${WSREP_SST_OPT_DATA}"
+MAGIC_FILE="${DATA}/ceph_sst_complete"
+
+
+# Setting the path for ss and ip
+export PATH="/usr/sbin:/sbin:$PATH"
+
+timeit(){
+    local stage=$1
+    shift
+    local cmd="$@"
+    local x1 x2 took extcode
+
+    if [[ $ttime -eq 1 ]];then 
+        x1=$(date +%s)
+        wsrep_log_info "Evaluating $cmd"
+        eval "$cmd"
+        extcode=$?
+        x2=$(date +%s)
+        took=$(( x2-x1 ))
+        wsrep_log_info "NOTE: $stage took $took seconds"
+        totime=$(( totime+took ))
+    else 
+        wsrep_log_info "Evaluating $cmd"
+        eval "$cmd"
+        extcode=$?
+    fi
+    return $extcode
+}
+
+get_transfer()
+{
+    if [[ -z $SST_PORT ]];then 
+        TSST_PORT=4444
+    else 
+        TSST_PORT=$SST_PORT
+    fi
+
+    if [[ $tfmt == 'nc' ]];then
+        if [[ ! -x `which nc` ]];then 
+            wsrep_log_error "nc(netcat) not found in path: $PATH"
+            exit 2
+        fi
+        wsrep_log_info "Using netcat as streamer"
+        if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]];then
+            if nc -h | grep -q ncat;then 
+                tcmd="nc -l ${TSST_PORT}"
+            else 
+                tcmd="nc -dl ${TSST_PORT}"
+            fi
+        else
+            tcmd="nc ${REMOTEIP} ${TSST_PORT}"
+        fi
+    else
+        tfmt='socat'
+        wsrep_log_info "Using socat as streamer"
+        if [[ ! -x `which socat` ]];then 
+            wsrep_log_error "socat not found in path: $PATH"
+            exit 2
+        fi
+
+        if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]];then
+            tcmd="socat -u TCP-LISTEN:${TSST_PORT},reuseaddr${sockopt} stdio"
+        else
+            tcmd="socat -u stdio TCP:${REMOTEIP}:${TSST_PORT}${sockopt}"
+        fi
+    fi
+
+}
+
+parse_cnf()
+{
+    local group=$1
+    local var=$2
+    # print the default settings for given group using my_print_default.
+    # normalize the variable names specified in cnf file (user can use _ or - for example log-bin or log_bin)
+    # then grep for needed variable
+    # finally get the variable value (if variables has been specified multiple time use the last value only)
+    reval=$($MY_PRINT_DEFAULTS -c $WSREP_SST_OPT_CONF $group | awk -F= '{if ($1 ~ /_/) { gsub(/_/,"-",$1); print $1"="$2 } else { print $0 }}' | grep -- "--$var=" | cut -d= -f2- | tail -1)
+    if [[ -z $reval ]];then 
+        [[ -n $3 ]] && reval=$3
+    fi
+    echo $reval
+}
+
+read_cnf()
+{
+    cephimage=$(parse_cnf sst cephimage "") # main cluster image
+    cephlocalpool=$(parse_cnf sst cephlocalpool "") 
+    cephmountoption=$(parse_cnf sst cephmountoption "rw,noatime")
+    cephmountpoint=$(parse_cnf sst cephmountpoint "${DATA}")
+    cephkeyring=$(parse_cnf sst cephkeyring "/etc/ceph/ceph.client.admin.keyring")
+    mysqluser=$(parse_cnf mysqld user "mysql")
+    stimeout=$(parse_cnf sst sst-initial-timeout 100)
+    ssyslog=$(parse_cnf sst sst-syslog 0)
+    ssystag=$(parse_cnf mysqld_safe syslog-tag "${SST_SYSLOG_TAG:-}")
+    ssystag+="-"
+
+    if [[ $ssyslog -ne -1 ]];then 
+        if my_print_defaults -c $WSREP_SST_OPT_CONF mysqld_safe | tr '_' '-' | grep -q -- "--syslog";then 
+            ssyslog=1
+        fi
+    fi
+}
+
+sig_joiner_cleanup()
+{
+    wsrep_log_error "Removing $MAGIC_FILE file due to signal"
+    rm -f "$MAGIC_FILE"
+}
+
+cleanup_joiner()
+{
+    # Since this is invoked just after exit NNN
+    local estatus=$?
+    if [[ $estatus -ne 0 ]];then 
+        wsrep_log_error "Cleanup after exit with status:$estatus"
+    fi
+    
+    # Final cleanup 
+    pgid=$(ps -o pgid= $$ | grep -o '[0-9]*')
+
+    # This means no setsid done in mysqld.
+    # We don't want to kill mysqld here otherwise.
+    if [[ $$ -eq $pgid ]];then
+
+        # This means a signal was delivered to the process.
+        # So, more cleanup. 
+        if [[ $estatus -ge 128 ]];then 
+            kill -KILL -$$ || true
+        fi
+
+    fi
+
+    exit $estatus
+}
+
+check_pid()
+{
+    local pid_file="$1"
+    [ -r "$pid_file" ] && ps -p $(cat "$pid_file") >/dev/null 2>&1
+}
+
+cleanup_donor()
+{
+    # Since this is invoked just after exit NNN
+    local estatus=$?
+    if [[ $estatus -ne 0 ]];then 
+        wsrep_log_error "Cleanup after exit with status:$estatus"
+    fi
+
+    # Final cleanup 
+    pgid=$(ps -o pgid= $$ | grep -o '[0-9]*')
+
+    # This means no setsid done in mysqld.
+    # We don't want to kill mysqld here otherwise.
+    if [[ $$ -eq $pgid ]];then
+
+        # This means a signal was delivered to the process.
+        # So, more cleanup. 
+        if [[ $estatus -ge 128 ]];then 
+            kill -KILL -$$ || true
+        fi
+
+    fi
+
+    exit $estatus
+
+}
+
+setup_ports()
+{
+    if [[ "$WSREP_SST_OPT_ROLE"  == "donor" ]];then
+        SST_PORT=$(echo $WSREP_SST_OPT_ADDR | awk -F '[:/]' '{ print $2 }')
+        REMOTEIP=$(echo $WSREP_SST_OPT_ADDR | awk -F ':' '{ print $1 }')
+        lsn=$(echo $WSREP_SST_OPT_ADDR | awk -F '[:/]' '{ print $4 }')
+        sst_ver=$(echo $WSREP_SST_OPT_ADDR | awk -F '[:/]' '{ print $5 }')
+    else
+        SST_PORT=$(echo ${WSREP_SST_OPT_ADDR} | awk -F ':' '{ print $2 }')
+    fi
+}
+
+if [[ ! -x `which $RBD_BIN` ]];then 
+    wsrep_log_error "rbd not in path: $PATH"
+    exit 2
+fi
+
+if [[ ! -x `which $SUDO_BIN` ]];then 
+    wsrep_log_error "sudo not in path: $PATH"
+    exit 2
+fi
+
+if [[ ! -x `which $MOUNT_BIN` ]];then 
+    wsrep_log_error "mount not in path: $PATH"
+    exit 2
+fi
+
+if [[ ! -x `which $UMOUNT_BIN` ]];then 
+    wsrep_log_error "umount not in path: $PATH"
+    exit 2
+fi
+
+rm -f "${MAGIC_FILE}"
+
+if [[ ! ${WSREP_SST_OPT_ROLE} == 'joiner' && ! ${WSREP_SST_OPT_ROLE} == 'donor' \
+      && ! ${WSREP_SST_OPT_ROLE} == 'mount'  \
+      ]];then 
+    wsrep_log_error "Invalid role ${WSREP_SST_OPT_ROLE}"
+    exit 22
+fi
+
+read_cnf
+
+if [[ ! -r $cephkeyring ]];then 
+    wsrep_log_error "Ceph keyring file $cephkeyring does not exists"
+    exit 2
+fi
+
+RBD_BIN="$RBD_BIN --keyring=${cephkeyring} "
+start_ts=$(date +%s)
+
+case "$WSREP_SST_OPT_ROLE" in
+    'donor')
+    
+        setup_ports
+        get_transfer
+
+        trap cleanup_donor EXIT
+    
+        # is DATA mounted?
+        if mount | grep -q $DATA; then
+            # yes, is it a rbd device?
+            mountdev=$(mount | grep $DATA | awk '{ print $1 }')
+            wsrep_log_info "Datadir currently mounted from $mountdev"
+            
+            # What was the mounted clone so we can remove it after?
+            currentimage=$(find -L /dev/rbd -samefile $mountdev | cut -d'/' -f4-)
+        else
+            wsrep_log_error "${DATA} is not a mount point" 
+            exit 32 
+        fi
+        
+        # is the image using format=2?
+        if rbd info $currentimage 2> /dev/null | grep 'format: ' | awk '{ print $2 }' | grep -q 2 ; then
+            # noop
+            :
+        else
+            wsrep_log_error "Ceph image $currentimage is not using image-format 2, can't clone it" 
+            exit 32 
+        fi
+    
+        RBDSNAP="${RBD_BIN} snap create ${currentimage}@${start_ts} 2>&1 | logger -p daemon.err -t ${ssystag}rbd-snap"
+        RBDSNAPPROTECT="${RBD_BIN} snap protect ${currentimage}@${start_ts} 2>&1 | logger -p daemon.err -t ${ssystag}rbd-snap-protect"
+        
+        FLUSHED="$WSREP_SST_OPT_DATA/tables_flushed"
+        rm -rf "$FLUSHED"
+
+        echo "flush tables"
+
+        # wait for tables flushed and state ID written to the file
+        while [ ! -r "$FLUSHED" ] && ! grep -q ':' "$FLUSHED" >/dev/null 2>&1
+        do
+            sleep 0.2
+        done
+
+        STATE="$(cat $FLUSHED)"
+        rm -rf "$FLUSHED"
+        
+        echo "$STATE" > "$MAGIC_FILE"
+
+        sync
+
+        wsrep_log_info "Taking a Ceph snapshot of $cephimage"
+
+        set +e
+        timeit "Ceph-Snap-SST" "$RBDSNAP; RC=( "\${PIPESTATUS[@]}" )"
+        set -e
+
+        if [ ${RC[0]} -ne 0 ]; then
+            wsrep_log_error "${RBD_BIN} finished with error: ${RC[0]}." \
+                            "Check syslog"
+            exit 22
+        elif [[ ${RC[1]} -ne 0 ]];then 
+            wsrep_log_error "logger finished with error: ${RC[1]}"
+            exit 22
+        fi
+
+        wsrep_log_info "Protecing the Ceph snapshot of ${cephimage}@${start_ts}"
+
+        set +e
+        timeit "Ceph-Snap-SST" "$RBDSNAPPROTECT; RC=( "\${PIPESTATUS[@]}" )"
+        set -e
+
+        if [ ${RC[0]} -ne 0 ]; then
+            wsrep_log_error "${RBD_BIN} finished with error: ${RC[0]}." \
+                            "Check syslog"
+            exit 22
+        elif [[ ${RC[1]} -ne 0 ]];then 
+            wsrep_log_error "logger finished with error: ${RC[1]}"
+            exit 22
+        fi
+
+        # Sending the new snapshot to clone to the joiner
+        # May need to wait a bit for the joiner to be ready
+        for i in `seq 1 5`; do
+            echo "${currentimage}@${start_ts}" | $tcmd 2>&1 > /dev/null
+            RC=( ${PIPESTATUS[@]} )
+            if [[ ${RC[1]} -ne 0 ]]; then 
+                if [[ $i -ne 5 ]]; then
+                    wsrep_log_info "waiting for joiner to open tcp port, attempt: $i"
+                else
+                    wsrep_log_error "Failed to send the snapshot name to the joiner"
+                    exit 22
+                fi
+            else
+                break;
+            fi
+            sleep 2
+        done
+
+        echo "done ${WSREP_SST_OPT_GTID}"
+        end_ts=`date +%s`
+        let donortime=end_ts-start_ts
+        wsrep_log_info "Total time on donor: $donortime seconds"
+        ;;
+    
+    'joiner')
+
+        setup_ports
+        get_transfer
+    
+        ADDR=${WSREP_SST_OPT_ADDR}
+        if [ -z "${SST_PORT}" ]
+        then
+            SST_PORT=4444
+            ADDR="$(echo ${WSREP_SST_OPT_ADDR} | awk -F ':' '{ print $1 }'):${SST_PORT}"
+        fi
+
+        trap sig_joiner_cleanup HUP PIPE INT TERM
+        trap cleanup_joiner EXIT
+
+        newsnap=$($tcmd)  # should be very quick, only a few bytes
+        
+        if [[ ${#newsnap} -eq 0 ]]; then
+            wsrep_log_error "Received an empty snapshot name from donor" 
+            exit 32
+        fi
+        
+        if ! ps -p ${WSREP_SST_OPT_PARENT} &>/dev/null
+        then
+            wsrep_log_error "Parent mysqld process (PID:${WSREP_SST_OPT_PARENT}) terminated unexpectedly." 
+            exit 32
+        fi
+
+        # Cleanup the binlogs if not in DATA
+        tempdir=$(parse_cnf mysqld log-bin "")
+        if [[ -n ${tempdir:-} ]];then
+            binlog_dir=$(dirname $tempdir)
+            binlog_file=$(basename $tempdir)
+            if [[ -n ${binlog_dir:-} && $binlog_dir != '.' && $binlog_dir != $DATA ]];then
+                pattern="$binlog_dir/$binlog_file\.[0-9]+$"
+                wsrep_log_info "Cleaning the binlog directory $binlog_dir as well"
+                find $binlog_dir -maxdepth 1 -type f -regex $pattern -exec rm -fv {} 1>&2 \+ || true
+                rm $binlog_dir/*.index || true
+            fi
+        fi
+
+        set +e
+        sudo $0 --role mount --address "$newsnap" --datadir ${DATA} \
+            --defaults-file $WSREP_SST_OPT_CONF  2>&1 > /dev/null
+        set -e
+
+        if [[ $? -ne 0 ]]; then 
+            wsrep_log_error "Calling with role mount failed" 
+            exit 32 
+        fi
+        
+        
+        if [[ ! -r ${MAGIC_FILE} ]];then 
+            wsrep_log_error "SST magic file ${MAGIC_FILE} not found/readable"
+            exit 2
+        fi
+
+        wsrep_log_info "Galera co-ords from recovery: $(cat ${MAGIC_FILE})"
+        cat "${MAGIC_FILE}" # output UUID:seqno
+        
+        end_ts=$(date +%s)
+        let joinertime=end_ts-start_ts
+        wsrep_log_info "Total time on joiner: $joinertime seconds"
+        ;;
+
+    'mount')
+            
+        # Running here as root!!!
+        # When in mount, WSREP_SST_OPT_ADDR is the name of the 
+        # snapshot to mount
+        
+        # is cephmountpoint mounted?
+        if mount | grep -q $cephmountpoint; then
+            # yes, is it a rbd device?
+            mountdev=$(mount | grep $cephmountpoint | awk '{ print $1 }')
+            wsrep_log_info "$cephmountpoint currently mounted from $mountdev"
+            
+            wsrep_log_info "umounting $cephmountpoint"
+
+            # TODO: verify if fuser -k is needed although it may kill MySQL
+            fuser -m $cephmountpoint > /tmp/sst-using-datadir  # for debugging
+
+            # umount, could lock if unable proceed
+            timeout 10 -k 5 umount $cephmountpoint 2>&1 | logger -p daemon.err -t ${ssystag}umount
+            
+            if [[ ${PIPESTATUS[0]} -ne 0 ]]; then 
+                wsrep_log_error "Failed to umount $cephmountpoint" 
+                exit 32 
+            fi
+
+            # What was the mounted clone so we can remove it after?
+            oldclone=$(find -L /dev/rbd -samefile $mountdev | cut -d'/' -f4-)
+            
+            if echo $mountdev | grep -q rbd; then
+                # the device was a ceph rbd device, need to unmap it
+                rbd unmap $mountdev 2>&1 | logger -p daemon.err -t ${ssystag}rbd-unmap 
+
+                if [[ ${PIPESTATUS[0]} -ne 0 ]]; then 
+                    wsrep_log_error "Failed to unmap ${mountdev}" 
+                    exit 32 
+                fi
+            fi
+        fi
+            
+        # Now, let's create a clone of the snapshot we got from the
+        # donor in WSREP_SST_OPT_ADDR, it is already in protect mode
+        ${RBD_BIN} clone $WSREP_SST_OPT_ADDR ${cephpool}/$(uname -n)-${start_ts} 2>&1 | logger -p daemon.err -t ${ssystag}rbd-clone
+        if [[ ${PIPESTATUS[0]} -ne 0 ]]; then 
+            wsrep_log_error "Failed to clone $WSREP_SST_OPT_ADDR to $cephpool/$(uname -n)-$start_ts" 
+            exit 32 
+        fi
+        
+        # Map new
+        rbddev=$(${RBD_BIN} map ${cephpool}/$(uname -n)-${start_ts} 2> >(logger -p daemon.err -t ${ssystag}rbd-map))
+        if [[ $? -ne 0 ]]; then 
+            wsrep_log_error "Failed to map a device to $cephpool/$(uname -n)-$start_ts" 
+            exit 32 
+        fi
+        
+        # Mount new
+        mount $rbddev ${cephmountpoint} -o $cephmountoptions 2>&1 | logger -p daemon.err -t ${ssystag}mount
+        if [[ ${PIPESTATUS[0]} -ne 0 ]]; then 
+            wsrep_log_error "Failed to execute: mount $rbddev ${cephmountpoint} -o $cephmountoptions" 
+            exit 32 
+        fi
+        
+        # Chown (Is binlog dir needed too?)
+        chown -R $mysqluser ${DATA} 
+        ;;
+
+        
+esac
+                
+            
+
+exit 0
