@@ -60,6 +60,7 @@ speciald=1
 cephmountpoint=""
 cephmountoption=""
 cephkeyring=""
+cephlocalpool=""
 mysqluser=""
 
 current_ts=0
@@ -521,16 +522,16 @@ case "$WSREP_SST_OPT_ROLE" in
             
         # Now, let's create a clone of the snapshot we got from the
         # donor in WSREP_SST_OPT_ADDR, it is already in protect mode
-        ${RBD_BIN} clone $WSREP_SST_OPT_ADDR ${cephpool}/$(uname -n)-${start_ts} 2>&1 | logger -p daemon.err -t ${ssystag}rbd-clone
+        ${RBD_BIN} clone $WSREP_SST_OPT_ADDR ${cephlocalpool}/$(uname -n)-${start_ts} 2>&1 | logger -p daemon.err -t ${ssystag}rbd-clone
         if [[ ${PIPESTATUS[0]} -ne 0 ]]; then 
-            wsrep_log_error "Failed to clone $WSREP_SST_OPT_ADDR to $cephpool/$(uname -n)-$start_ts" 
+            wsrep_log_error "Failed to clone $WSREP_SST_OPT_ADDR to $cephlocalpool/$(uname -n)-$start_ts" 
             exit 32 
         fi
         
         # Map new
-        rbddev=$(${RBD_BIN} map ${cephpool}/$(uname -n)-${start_ts} 2> >(logger -p daemon.err -t ${ssystag}rbd-map))
+        rbddev=$(${RBD_BIN} map ${cephlocalpool}/$(uname -n)-${start_ts} 2> >(logger -p daemon.err -t ${ssystag}rbd-map))
         if [[ $? -ne 0 ]]; then 
-            wsrep_log_error "Failed to map a device to $cephpool/$(uname -n)-$start_ts" 
+            wsrep_log_error "Failed to map a device to $cephlocalpool/$(uname -n)-$start_ts" 
             exit 32 
         fi
         
@@ -552,3 +553,4 @@ esac
             
 
 exit 0
+q:
