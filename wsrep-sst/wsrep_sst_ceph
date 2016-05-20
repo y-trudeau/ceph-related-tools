@@ -315,15 +315,15 @@ case "$WSREP_SST_OPT_ROLE" in
         trap cleanup_donor EXIT
     
         # is DATA mounted?
-        if mount | grep -q $DATA; then
+        if mount | grep -q ${DATA%%+(/)}; then
             # yes, is it a rbd device?
-            mountdev=$(mount | grep $DATA | awk '{ print $1 }')
+            mountdev=$(mount | grep ${DATA%%+(/)} | awk '{ print $1 }')
             wsrep_log_info "Datadir currently mounted from $mountdev"
             
             # What was the mounted clone so we can remove it after?
             currentimage=$(find -L /dev/rbd -samefile $mountdev | cut -d'/' -f4-)
         else
-            wsrep_log_error "${DATA} is not a mount point" 
+            wsrep_log_error "${DATA%%+(/)} is not a mount point" 
             exit 32 
         fi
         
