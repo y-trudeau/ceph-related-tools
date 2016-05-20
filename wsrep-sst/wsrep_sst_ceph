@@ -430,7 +430,6 @@ case "$WSREP_SST_OPT_ROLE" in
         trap sig_joiner_cleanup HUP PIPE INT TERM
         trap cleanup_joiner EXIT
 
-        echo "ready ${ADDR}/ceph_sst"
         newsnap=$($tcmd)  # should be very quick, only a few bytes
         
         if [[ ${#newsnap} -eq 0 ]]; then
