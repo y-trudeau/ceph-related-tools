@@ -262,6 +262,21 @@ setup_ports()
     fi
 }
 
+# waits ~10 seconds for nc to open the port and then reports ready
+# (regardless of timeout)
+wait_for_listen()
+{
+    local PORT=$1
+    local ADDR=$2
+    local MODULE=$3
+    for i in {1..50}
+    do
+        ss -p state listening "( sport = :$PORT )" | grep -qE 'socat|nc' && break
+        sleep 0.2
+    done
+    echo "ready ${ADDR}/${MODULE}//$sst_ver"
+}
+
 if [[ ! -x `which $RBD_BIN` ]];then 
     wsrep_log_error "rbd not in path: $PATH"
     exit 2
@@ -401,6 +416,8 @@ case "$WSREP_SST_OPT_ROLE" in
         setup_ports
         get_transfer
     
+        MODULE="ceph_sst"
+        
         ADDR=${WSREP_SST_OPT_ADDR}
         if [ -z "${SST_PORT}" ]
         then
@@ -408,9 +425,12 @@ case "$WSREP_SST_OPT_ROLE" in
             ADDR="$(echo ${WSREP_SST_OPT_ADDR} | awk -F ':' '{ print $1 }'):${SST_PORT}"
         fi
 
+        wait_for_listen ${SST_PORT} ${ADDR} ${MODULE} &
+        
         trap sig_joiner_cleanup HUP PIPE INT TERM
         trap cleanup_joiner EXIT
 
+        echo "ready ${ADDR}/ceph_sst"
         newsnap=$($tcmd)  # should be very quick, only a few bytes
         
         if [[ ${#newsnap} -eq 0 ]]; then
