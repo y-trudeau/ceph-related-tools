@@ -81,9 +81,8 @@ declare -a RC
 
 RBD_BIN=$(which rbd)
 
-DATA="${WSREP_SST_OPT_DATA}"
+DATA=$(echo ${WSREP_SST_OPT_DATA} | sed 's:/*$::') #remove trailing / if any
 MAGIC_FILE="${DATA}/ceph_sst_complete"
-
 
 # Setting the path for ss and ip
 export PATH="/usr/sbin:/sbin:$PATH"
@@ -126,7 +125,7 @@ get_transfer()
         fi
         wsrep_log_info "Using netcat as streamer"
         if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]];then
-            if nc -h | grep -q ncat;then 
+            if nc -h 2>/dev/null | grep -q ncat;then 
                 tcmd="nc -l ${TSST_PORT}"
             else 
                 tcmd="nc -dl ${TSST_PORT}"
@@ -315,15 +314,15 @@ case "$WSREP_SST_OPT_ROLE" in
         trap cleanup_donor EXIT
     
         # is DATA mounted?
-        if mount | grep -q ${DATA%%+(/)}; then
+        if mount | grep -q ${DATA}; then
             # yes, is it a rbd device?
-            mountdev=$(mount | grep ${DATA%%+(/)} | awk '{ print $1 }')
+            mountdev=$(mount | grep ${DATA} | awk '{ print $1 }')
             wsrep_log_info "Datadir currently mounted from $mountdev"
             
             # What was the mounted clone so we can remove it after?
             currentimage=$(find -L /dev/rbd -samefile $mountdev | cut -d'/' -f4-)
         else
-            wsrep_log_error "${DATA%%+(/)} is not a mount point" 
+            wsrep_log_error "${DATA} is not a mount point" 
             exit 32 
         fi
         
@@ -438,11 +437,11 @@ case "$WSREP_SST_OPT_ROLE" in
             exit 32
         fi
         
-        if ! ps -p ${WSREP_SST_OPT_PARENT} &>/dev/null
-        then
-            wsrep_log_error "Parent mysqld process (PID:${WSREP_SST_OPT_PARENT}) terminated unexpectedly." 
-            exit 32
-        fi
+        #if ! ps -p ${WSREP_SST_OPT_PARENT} &>/dev/null
+        #then
+        #    wsrep_log_error "Parent mysqld process (PID:${WSREP_SST_OPT_PARENT}) terminated unexpectedly." 
+        #    exit 32
+        #fi
 
         # Cleanup the binlogs if not in DATA
         tempdir=$(parse_cnf mysqld log-bin "")
