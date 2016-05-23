@@ -61,6 +61,7 @@ cephmountpoint=""
 cephmountoptions=""
 cephkeyring=""
 cephlocalpool=""
+cephcleanup=0
 mysqluser=""
 
 current_ts=0
@@ -172,6 +173,7 @@ read_cnf()
     cephmountoptions=$(parse_cnf sst cephmountoption "rw,noatime")
     cephmountpoint=$(parse_cnf sst cephmountpoint "${DATA}")
     cephkeyring=$(parse_cnf sst cephkeyring "/etc/ceph/ceph.client.admin.keyring")
+    cephcleanup=$(parse_cnf sst cephcleanup "0")
     mysqluser=$(parse_cnf mysqld user "mysql")
     stimeout=$(parse_cnf sst sst-initial-timeout 100)
     ssyslog=$(parse_cnf sst sst-syslog 0)
@@ -437,6 +439,8 @@ case "$WSREP_SST_OPT_ROLE" in
             exit 32
         fi
         
+        wsrep_log_info "Received snapshot to clone: ${newsnap}"
+        
         #if ! ps -p ${WSREP_SST_OPT_PARENT} &>/dev/null
         #then
         #    wsrep_log_error "Parent mysqld process (PID:${WSREP_SST_OPT_PARENT}) terminated unexpectedly." 
@@ -542,7 +546,41 @@ case "$WSREP_SST_OPT_ROLE" in
         fi
         
         # Chown (Is binlog dir needed too?)
-        chown -R $mysqluser ${DATA} 
+        chown -R $mysqluser ${DATA}
+        
+        # Removing files that shouldn't be there
+        rm -f ${DATA}/galera.cache ${DATA}/grastate.dat ${DATA}/gvwstate.dat
+        
+        # Now, if cephcleanup is set, let's remove the old snap
+        if [[ $cephcleanup -eq 1 ]]; then
+            # first, let's unmap all unused clones
+            for rlink in $(find -L /dev/rbd/${cephlocalpool} -xtype l | grep -v $(uname -n)-${start_ts}); do
+                rdev=$(readlink -f $rlink)
+                if ! mount | grep -q ${rdev}; then
+                    # not mounted so we can proceed and unmap
+                    rbd unmap $rdev 
+
+                    # Extract the clone name
+                    clonename=$(echo $rlink | cut -d'/' -f4-)
+
+                    # record the parent name
+                    cloneparent=$(${RBD_BIN} info ${clonename} | grep parent | cut -d':' -f2 | cut -d' ' -f2)
+
+                    # remove the clone (which could even be the original image)
+                    ${RBD_BIN} rm ${clonename} 2>&1 | logger -p daemon.err -t ${ssystag}clonerm
+                    
+                    # is there a parent?
+                    if [[ ${#cloneparent} -gt 0 ]]
+                        # can we remove the parent?
+                        if [[ $(${RBD_BIN}  children $cloneparent | wc -l) -eq 0 ]]; then
+                            # no child, yes
+                            ${RBD_BIN} snap unprotect $cloneparent 2>&1 | logger -p daemon.err -t ${ssystag}snapunprotect
+                            ${RBD_BIN} snap rm $cloneparent 2>&1 | logger -p daemon.err -t ${ssystag}snaprm
+                        fi
+                    fi
+                fi
+            done
+        fi
         
         ;;
 
