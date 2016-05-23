@@ -570,7 +570,7 @@ case "$WSREP_SST_OPT_ROLE" in
                     ${RBD_BIN} rm ${clonename} 2>&1 | logger -p daemon.err -t ${ssystag}clonerm
                     
                     # is there a parent?
-                    if [[ ${#cloneparent} -gt 0 ]]
+                    if [[ ${#cloneparent} -gt 0 ]]; then
                         # can we remove the parent?
                         if [[ $(${RBD_BIN}  children $cloneparent | wc -l) -eq 0 ]]; then
                             # no child, yes
