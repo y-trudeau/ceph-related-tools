@@ -170,7 +170,7 @@ parse_cnf()
 read_cnf()
 {
     cephlocalpool=$(parse_cnf sst cephlocalpool "") 
-    cephmountoptions=$(parse_cnf sst cephmountoption "rw,noatime")
+    cephmountoptions=$(parse_cnf sst cephmountoptions "rw,noatime")
     cephmountpoint=$(parse_cnf sst cephmountpoint "${DATA}")
     cephkeyring=$(parse_cnf sst cephkeyring "/etc/ceph/ceph.client.admin.keyring")
     cephcleanup=$(parse_cnf sst cephcleanup "0")
@@ -590,4 +590,4 @@ esac
             
 
 exit 0
-q:
+
