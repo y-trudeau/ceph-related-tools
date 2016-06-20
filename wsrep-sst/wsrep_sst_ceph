@@ -169,7 +169,7 @@ parse_cnf()
 
 read_cnf()
 {
-    cephlocalpool=$(parse_cnf sst cephlocalpool "") 
+    cephlocalpool=$(parse_cnf sst cephlocalpool "mysqlpool") 
     cephmountoptions=$(parse_cnf sst cephmountoptions "rw,noatime")
     cephmountpoint=$(parse_cnf sst cephmountpoint "${DATA}")
     cephkeyring=$(parse_cnf sst cephkeyring "/etc/ceph/ceph.client.admin.keyring")
@@ -470,6 +470,22 @@ case "$WSREP_SST_OPT_ROLE" in
             exit 32 
         fi
         
+        # setup existing binlog files if requested
+        if  [[ ! -z $WSREP_SST_OPT_BINLOG ]];then
+
+            BINLOG_DIRNAME=$(dirname $WSREP_SST_OPT_BINLOG)
+            BINLOG_FILENAME=$(basename $WSREP_SST_OPT_BINLOG)
+
+            # To avoid comparing data directory and BINLOG_DIRNAME 
+            mv $DATA/${BINLOG_FILENAME}.* $BINLOG_DIRNAME/ 2>/dev/null || true
+
+            pushd $BINLOG_DIRNAME &>/dev/null
+            for bfiles in $(ls -1 ${BINLOG_FILENAME}.*);do
+                echo ${BINLOG_DIRNAME}/${bfiles} >> ${BINLOG_FILENAME}.index
+            done
+            popd &> /dev/null
+
+        fi
         
         if [[ ! -r ${MAGIC_FILE} ]];then 
             wsrep_log_error "SST magic file ${MAGIC_FILE} not found/readable"
