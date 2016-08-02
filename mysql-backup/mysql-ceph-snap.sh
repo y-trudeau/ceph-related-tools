@@ -175,7 +175,7 @@ if [ -z "$loginpath" ]; then
 		fi
 	fi
 else
-	MYSQLOPTIONS="$MYSQLOPTIONS --login-path=$loginpath "
+	MYSQLOPTIONS=" --login-path=$loginpath $MYSQLOPTIONS "
 fi
 
 if [ ! -z "$socket" ]; then
