@@ -43,11 +43,13 @@ ECHO=`which echo`
 AWK=`which awk`
 
 # set default values
-DEFAULTOPT=
+DEFAULTOPT=custom
+customretention=99999
 PREFIX="MySQL"
 LABEL=`${DATE} +"%FT%H:%M"`
 vflag=
 pflag=
+rflag=0
 socket=
 mysql_user=
 password=
@@ -58,7 +60,7 @@ warmup=
 mysqlmount=/var/lib/mysql
 
 # go through passed options and assign to variables
-while getopts 'hd:c:m:vpu:I:k:i:l:S:P:w:' OPTION
+while getopts 'hd:c:m:vpru:I:k:i:l:S:P:R:w:' OPTION
 do
         case $OPTION in
         d)      DEFAULTOPT="$OPTARG"
@@ -70,6 +72,8 @@ do
         v)      vflag=1
                 ;;
         p)      pflag=1
+                ;;
+        r)      rflag=1
                 ;;
         u)      mysqluser="$OPTARG"
                 ;;
@@ -85,11 +89,13 @@ do
                 ;;
         P)      password="$OPTARG"
                 ;;
+        R)      customretention="$OPTARG"
+                ;;
         w)      warmup="$OPTARG"
                 ;;
-        h|?)      printf "Usage: %s: [-h] [-d <default-preset>] [-v] [-p] [-u <mysql user>] [-P <mysql password>] [-l <login-path>] [-S <mysql socket>] [-i <Ceph image path, ex: pool/image >] [-m <mysql datadir> [-w <warmup sql script>]\n\n
+        h|?)      printf "Usage: %s: [-h] -d <default-preset> [-v] [-p] [-r] [-R <custome retention>] [-u <mysql user>] [-P <mysql password>] [-l <login-path>] [-S <mysql socket>] [-i <Ceph image path, ex: pool/image >] [-m <mysql datadir> [-w <warmup sql script>]\n\n
 	-h\t\tThis help
-	-d\t\tDefault preset {hourly,daily,weekly,monthly,yearly} (Mandatory or -d)
+	-d\t\tDefault preset {hourly,daily,weekly,monthly,yearly,timely} (Mandatory)
 	  \t\tName\tLabel\tretention
 	  \t\t-------------------------
 	  \t\thourly\tAutoH\t24
@@ -97,6 +103,8 @@ do
 	  \t\tweekly\tAutoW\t4
 	  \t\tmonthly\tAutoM\t12
 	  \t\tyearly\tAutoM\t10
+	  \t\tcustom\tTime\tfrom -R option (default)
+	-R\t\tCustom retention, default = 99999
 	-c\t\tCustom prefix (Default = MySQL)
 	-v\t\tVerbose mode
 	-p\t\tPretend mode, fake actions
@@ -107,6 +115,7 @@ do
 	-I\t\tCeph image path which is used by MySQL (Mandatory)
 	-k\t\tCephX keyring file
 	-i\t\tCephX id 
+	-r\t\tReplace the snapshot if a snapshot of that name already exists
 	-m\t\tMySQL datadir (Mandatory)
 	-w\t\tWarmup script, typically useful for MyISAM tables after the flush tables 
 "$(basename $0) >&2
@@ -114,6 +123,11 @@ do
                 ;;
         esac
 done
+
+
+if [ "$vflag" ]; then
+        echo "Processing options" 
+fi
 
 # go through possible presets if available
 if [ -n "$DEFAULTOPT" ]; then
@@ -137,6 +151,10 @@ if [ -n "$DEFAULTOPT" ]; then
         yearly) LABELPREFIX="${PREFIX}_AutoY"
                 LABEL=`${DATE} +"%Y"`
                 retention=10
+                ;;
+        custom) LABELPREFIX="${PREFIX}_Time"
+                LABEL=`${DATE} +"%FT%H:%M:%S"`
+                retention=$customretention
                 ;;
         *)      printf 'Default option not specified\n'
                 exit 2
@@ -180,6 +198,25 @@ fi
 
 if [ -z "$pflag" ]; then
 
+	SnapExists=$(${RBD} $RBDOPTIONS snap ls $cephimage | ${GREP} -c $LABELPREFIX-$LABEL)
+	if [ "$SnapExists" -gt "0" ]; then
+		if [ "$vflag" ]; then
+        		echo "Snapshot with the name $LABELPREFIX-$LABEL already exists for $cephimage" 
+		fi
+		if [ "$rflag" -eq "1" ]; then
+			if [ "$vflag" ]; then
+        			echo "Replace option provided, removing snapshot $LABELPREFIX-$LABEL" 
+			fi
+			${RBD} $RBDOPTIONS snap rm $cephimage@$LABELPREFIX-$LABEL
+		else
+			exit
+		fi		
+	fi
+
+	if [ "$vflag" ]; then
+        	echo "Taking the snapshot" 
+	fi
+
 	if [ -d "${mysqlmount}" ]; then
 	        $MYSQL $MYSQLOPTIONS > /${mysqlmount}/snap_master_pos.out <<EOF
 flush tables with read lock;
@@ -212,7 +249,7 @@ fi
 
 list=`${RBD} $RBDOPTIONS snap ls $cephimage | ${GREP} $LABELPREFIX | \
 ${AWK} '{ print $2 }' | ${SORT} -r | ${TAIL} -n +${retention} | \
-while read line; do ${ECHO} "$line|"; done`
+while read line; do ${ECHO} "$line "; done`
 
 if [ ! -z "$pflag" ]; then
         if [ "${#list}" -gt 0 ]; then
@@ -223,15 +260,12 @@ if [ ! -z "$pflag" ]; then
         fi
 else
         if [ "${#list}" -gt 0 ]; then
-                IFS='|'
                 for snap in $list; do 
-                        snapid=`echo $snap | tr -d '\n' | awk '{ print $2}'`;
                         if [ "$vflag" ]; then
-                                echo "Deleting snapshot $snapid"
+                                echo "Deleting snapshot $snap"
                         fi
-                        $RBD $RBDOPTIONS snap rm $cephimage@$snapid
+                        $RBD $RBDOPTIONS snap rm $cephimage@$snap
                 done 
-                unset IFS
         fi
 fi
 
