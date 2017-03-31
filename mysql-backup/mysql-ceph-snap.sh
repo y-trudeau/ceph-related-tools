@@ -4,7 +4,7 @@
 # Yves Trudeau, Percona
 # Inspired by zfs_snap of Nils Bausch
 #
-# take EBS snapshots with a time stamp
+# take Ceph snapshot (RBD devices)
 # -h help page
 # -d choose default options: hourly, daily, weekly, monthly, yearly
 # -i image path, pool/image  
@@ -14,10 +14,9 @@
 # -S mysql socket
 # -u user mysql user
 # -P mysql password 
-# -w warmup script
 # -x cephX auth file
 
-DEBUGFILE="/tmp/mysql-ebs-snap.log"
+DEBUGFILE="/tmp/mysql-ceph-snap.log"
 if [ "${DEBUGFILE}" -a -w "${DEBUGFILE}" -a ! -L "${DEBUGFILE}" ]; then
         exec 9>>"$DEBUGFILE"
         exec 2>&9
@@ -56,6 +55,7 @@ password=
 loginpath=
 cephimage=
 cephkeyring=
+cephc=ceph
 warmup=
 mysqlmount=/var/lib/mysql
 
@@ -63,7 +63,7 @@ mysqlmount=/var/lib/mysql
 while getopts 'hd:c:m:vpru:I:k:i:l:S:P:R:w:' OPTION
 do
         case $OPTION in
-        d)      DEFAULTOPT="$OPTARG"
+        b)      DEFAULTOPT="$OPTARG"
                 ;;
         c)      PREFIX="$OPTARG"
                 ;;
@@ -91,33 +91,31 @@ do
                 ;;
         R)      customretention="$OPTARG"
                 ;;
-        w)      warmup="$OPTARG"
-                ;;
         h|?)      printf "Usage: %s: [-h] -d <default-preset> [-v] [-p] [-r] [-R <custome retention>] [-u <mysql user>] [-P <mysql password>] [-l <login-path>] [-S <mysql socket>] [-i <Ceph image path, ex: pool/image >] [-m <mysql datadir> [-w <warmup sql script>]\n\n
 	-h\t\tThis help
-	-d\t\tDefault preset {hourly,daily,weekly,monthly,yearly,timely} (Mandatory)
+	-b\t\tBackup type {hourly,daily,weekly,monthly,yearly,custom} (Mandatory)
 	  \t\tName\tLabel\tretention
 	  \t\t-------------------------
 	  \t\thourly\tAutoH\t24
 	  \t\tdaily\tAutoD\t7
 	  \t\tweekly\tAutoW\t4
-	  \t\tmonthly\tAutoM\t12
+ 	  \t\tmonthly\tAutoM\t12
 	  \t\tyearly\tAutoM\t10
 	  \t\tcustom\tTime\tfrom -R option (default)
-	-R\t\tCustom retention, default = 99999
+	-R\t\tCustom retention, default = $customretention
 	-c\t\tCustom prefix (Default = MySQL)
 	-v\t\tVerbose mode
 	-p\t\tPretend mode, fake actions
 	-u\t\tMySQL user (Mandatory or -l) 
 	-P\t\tMySQL password (Mandatory or -l) 
-	-l\t\tMySQL 5.6+ login-path, execludes -u and -P (Mandatory or -u and -P), overrides -u and -p
+	-l\t\tMySQL 5.6+ login-path, excludes -u and -P (Mandatory or -u and -P), overrides -u and -p
 	-S\t\tMySQL socket (Mandatory)
 	-I\t\tCeph image path which is used by MySQL (Mandatory)
 	-k\t\tCephX keyring file
 	-i\t\tCephX id 
+    -C\t\tCeph cluster name (default is ceph)
 	-r\t\tReplace the snapshot if a snapshot of that name already exists
-	-m\t\tMySQL datadir (Mandatory)
-	-w\t\tWarmup script, typically useful for MyISAM tables after the flush tables 
+	-m\t\tMySQL datadir (default: /var/lib/mysql)
 "$(basename $0) >&2
                 exit 2
                 ;;
@@ -162,6 +160,11 @@ if [ -n "$DEFAULTOPT" ]; then
         esac
 fi
 
+if [ ! -d "$datadir" ]; then
+    echo "Mysql datadir: $datadir doesn't exist"
+    exit 1
+fi
+
 MYSQLOPTIONS="-N -n "
 
 if [ -z "$loginpath" ]; then
@@ -192,8 +195,20 @@ if [ ! -z "$cephkeyring" ]; then
 fi
 
 if [ -z "$cephimage" ]; then
-	echo "A Ceph image to snapshot must be provided"
-	exit 1
+    # let's try to determine the device and image
+    rbddev=$(df -P $datadir | grep $datadir | awk '{ print }')
+    cephimage=$(${RBD} $RBDOPTIONS showmapped | grep $rbddev | awk '{ print $2"/"$3 }'
+
+    # have we found something?
+    if [ -z "$cephimage" ]; then
+        # no, have to exit
+    	echo "A Ceph image to snapshot must be provided"
+	    exit 1
+    fi
+
+    if [ "$vflag" ]; then
+        echo "The Ceph image is: $cephimage" 
+    if                              fi
 fi
 
 if [ -z "$pflag" ]; then
@@ -205,7 +220,7 @@ if [ -z "$pflag" ]; then
 		fi
 		if [ "$rflag" -eq "1" ]; then
 			if [ "$vflag" ]; then
-        			echo "Replace option provided, removing snapshot $LABELPREFIX-$LABEL" 
+        			echo "Replace option provided, trying to remove the snapshot $LABELPREFIX-$LABEL" 
 			fi
 			${RBD} $RBDOPTIONS snap rm $cephimage@$LABELPREFIX-$LABEL
 		else
@@ -231,13 +246,12 @@ EOF
 	fi
 fi
 
-        if [ "$vflag" ]; then
-                echo "Snapshot taken"
-        fi
-
-if [ "$warmup" ]; then
-        cat $warmup |  $MYSQL $MYSQLOPTIONS &
+if [ "$vflag" ]; then
+    echo "Snapshot taken"
 fi
+
+# output the snapshot name for easy scripting around
+echo "SNAPSHOT=$cephimage@$LABELPREFIX-$LABEL"
 
 #DELETE SNAPSHOTS
 # adjust retention to work with tail i.e. increase by one
@@ -260,11 +274,28 @@ if [ ! -z "$pflag" ]; then
         fi
 else
         if [ "${#list}" -gt 0 ]; then
-                for snap in $list; do 
-                        if [ "$vflag" ]; then
-                                echo "Deleting snapshot $snap"
+                for snap in $list; do
+                        #  the children of the snapshot
+                        CanRemoveSnap=1
+                        for child in $(${RBD} $RBDOPTIONS children $cephimage@$snap); do
+                           # try to delete the child, will error if mapped somewhere
+                           ${RBD} $RBDOPTIONS rm $child > /dev/null 2> /dev/null
+                           if [ "$?" -ne "0" ]; then 
+                               CanRemoveSnap=0
+                           fi
+                        done
+
+                        if [ "$CanRemoveSnap" -eq "1" ]; then
+                            if [ "$vflag" ]; then
+                                    echo "Deleting snapshot $snap"
+                            fi
+                            $RBD $RBDOPTIONS snap unprotect $cephimage@$snap
+                            $RBD $RBDOPTIONS snap rm $cephimage@$snap
+                        else
+                            if [ "$vflag" ]; then
+                                    echo "Can't delete snapshot $snap, at least one child is in use"
+                            fi
                         fi
-                        $RBD $RBDOPTIONS snap rm $cephimage@$snap
                 done 
         fi
 fi
