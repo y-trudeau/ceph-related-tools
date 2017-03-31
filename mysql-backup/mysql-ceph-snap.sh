@@ -289,8 +289,8 @@ else
                             if [ "$vflag" ]; then
                                     echo "Deleting snapshot $snap"
                             fi
-                            $RBD $RBDOPTIONS snap unprotect $cephimage@$snap
-                            $RBD $RBDOPTIONS snap rm $cephimage@$snap
+                            $RBD $RBDOPTIONS snap unprotect $cephimage@$snap > /dev/null 2> /dev/null
+                            $RBD $RBDOPTIONS snap rm $cephimage@$snap > /dev/null 2> /dev/null
                         else
                             if [ "$vflag" ]; then
                                     echo "Can't delete snapshot $snap, at least one child is in use"
