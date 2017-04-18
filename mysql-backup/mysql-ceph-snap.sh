@@ -60,7 +60,7 @@ warmup=
 mysqlmount=/var/lib/mysql
 
 # go through passed options and assign to variables
-while getopts 'hd:c:m:vpru:I:k:i:l:S:P:R:w:' OPTION
+while getopts 'b:hd:c:m:vpru:I:k:i:l:S:P:R:w:' OPTION
 do
         case $OPTION in
         b)      DEFAULTOPT="$OPTARG"
@@ -160,7 +160,7 @@ if [ -n "$DEFAULTOPT" ]; then
         esac
 fi
 
-if [ ! -d "$datadir" ]; then
+if [ ! -d "$mysqlmount" ]; then
     echo "Mysql datadir: $datadir doesn't exist"
     exit 1
 fi
@@ -196,8 +196,8 @@ fi
 
 if [ -z "$cephimage" ]; then
     # let's try to determine the device and image
-    rbddev=$(df -P $datadir | grep $datadir | awk '{ print }')
-    cephimage=$(${RBD} $RBDOPTIONS showmapped | grep $rbddev | awk '{ print $2"/"$3 }'
+    rbddev=$(df -P $mysqlmount | grep $mysqlmount | awk '{ print $1 }')
+    cephimage=$(${RBD} $RBDOPTIONS showmapped | grep $rbddev | awk '{ print $2"/"$3 }')
 
     # have we found something?
     if [ -z "$cephimage" ]; then
@@ -208,7 +208,7 @@ if [ -z "$cephimage" ]; then
 
     if [ "$vflag" ]; then
         echo "The Ceph image is: $cephimage" 
-    if                              fi
+    fi
 fi
 
 if [ -z "$pflag" ]; then
